@@ -1,0 +1,3 @@
+pendulum
+python-telegram-bot
+pyyaml
