@@ -1,0 +1,9 @@
+version: "3.8"
+
+services:
+    forwarder_bot:
+        build: .
+        volumes:
+          - type: bind
+            source: db
+            target: /app/db 
