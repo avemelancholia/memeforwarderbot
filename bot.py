@@ -47,8 +47,8 @@ def update_user_table(user_id, chat_type):
     con.close()
 
 
-def get_user_time_diff_abuse(user_id, chat_type):
-    time_diff = 0
+def get_user_time_diff_abuse(user_id, chat_type, cooldown):
+    time_diff = cooldown + 10
     abuse = 0
     now = pdl.now().int_timestamp
     args = {'table': chat_type}
@@ -79,9 +79,9 @@ async def user_can_forward(context, message, chat_type, chats, cooldown):
         chat_member.status == 'creator'
     )
     member_id_ok = reply_user_id == user_id
-    time_diff, abuse = get_user_time_diff_abuse(user_id, chat_type)
+    time_diff, abuse = get_user_time_diff_abuse(user_id, chat_type, cooldown)
     print(time_diff, cooldown + abuse * 10)
-    time_ok = True if (time_diff < cooldown + abuse * 10) else False
+    time_ok = True if (time_diff > cooldown + abuse * 10) else False
 
     if (chat_type == 'ascended') and role_ok and time_ok:
         can_forward = True
@@ -127,6 +127,7 @@ async def insert_meme_in_db_if_ok(message, chat_type):
         hash_str += reply.text
     if caption_present:
         hash_str += reply.caption
+    print(hash_str)
 
     hash_str = hash_str.encode('utf8')
     hash_str = hashlib.sha256(hash_str).hexdigest()
