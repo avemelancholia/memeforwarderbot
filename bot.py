@@ -46,7 +46,7 @@ def update_user_table(user_id, chat_type):
     timestamp = pdl.now().int_timestamp
     abuse = 0
     args = {"table": chat_type}
-    con = sqlite3.connect("meme_forwarder.db")
+    con = sqlite3.connect("db/meme_forwarder.db")
     cur = con.cursor()
     res = cur.execute(get_sql_query("select_user", args) + f"'{user_id}'").fetchone()
 
@@ -65,7 +65,7 @@ def get_user_time_diff_abuse(user_id, chat_type):
     abuse = 0
     now = pdl.now().int_timestamp
     args = {"table": chat_type}
-    con = sqlite3.connect("meme_forwarder.db")
+    con = sqlite3.connect("db/meme_forwarder.db")
     cur = con.cursor()
     res = cur.execute(get_sql_query("select_user", args) + f"'{user_id}'").fetchone()
     con.close()
@@ -144,7 +144,7 @@ async def insert_meme_in_db_if_ok(message, chat_type):
     datetime = str(pdl.now().int_timestamp)
     args = {"table": f"{chat_type}"}
 
-    con = sqlite3.connect("meme_forwarder.db")
+    con = sqlite3.connect("db/meme_forwarder.db")
     cur = con.cursor()
     res = cur.execute(get_sql_query("select_hashed", args) + f"'{hash_str}'")
     if res.fetchone() is None:
@@ -164,7 +164,7 @@ async def insert_meme_in_db_if_ok(message, chat_type):
 
 
 def create_tables_if_missing(chats):
-    con = sqlite3.connect("meme_forwarder.db")
+    con = sqlite3.connect("db/meme_forwarder.db")
     cur = con.cursor()
     for table in chats.keys():
         args = {"table": table}
@@ -175,7 +175,7 @@ def create_tables_if_missing(chats):
 
 def manage_db_rows(chat_type):
     args = {"table": f"{chat_type}"}
-    con = sqlite3.connect("meme_forwarder.db")
+    con = sqlite3.connect("db/meme_forwarder.db")
     cur = con.cursor()
     ids = cur.execute(get_sql_query("get_ids_by_timestamp", args)).fetchall()
 
