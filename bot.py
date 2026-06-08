@@ -4,13 +4,13 @@ import yaml
 import logging
 import sqlite3
 import hashlib
-import re
 from sql_queries import get_sql_query
 import pendulum as pdl
 from telegram import Update
 from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import (
     Application,
+    CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -295,6 +295,19 @@ async def error_handler(update, context):
         logger.error('Unexpected error while handling update', exc_info=exc_info)
 
 
+async def log_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+
+    logger.info(
+        'Received command in chat_id=%s text=%r from_user=%s',
+        update.effective_chat.id if update.effective_chat else None,
+        message.text,
+        update.effective_user.id if update.effective_user else None,
+    )
+
+
 async def meme_forward_pinnacle(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -330,6 +343,18 @@ async def meme_forward_pinnacle(
         logger.exception('Telegram error while copying pinnacle meme')
 
 
+async def post_init(application: Application) -> None:
+    try:
+        me = await application.bot.get_me()
+        logger.info('Bot started as @%s', me.username)
+    except (TimedOut, NetworkError, RetryAfter) as exc:
+        logger.warning('Transient Telegram error while reading bot info: %s', exc)
+    except TelegramError:
+        logger.exception('Telegram error while reading bot info')
+
+    logger.info('Configured chats: %s', application.bot_data['chats'])
+
+
 def main() -> None:
 
     with open('config.yaml', 'r') as f:
@@ -338,7 +363,6 @@ def main() -> None:
     limit_ids = 300
     token = data['token']
     cooldown = data['cooldown']
-    bot_name = data['bot_name']
     chats = {
         'ascended': data['ascended'],
         'pinnacle': data['pinnacle'],
@@ -351,41 +375,50 @@ def main() -> None:
         write_timeout=30,
         pool_timeout=15,
     )
-    application = Application.builder().token(token).request(request).build()
+    application = (
+        Application.builder()
+        .token(token)
+        .request(request)
+        .post_init(post_init)
+        .build()
+    )
     application.bot_data['limit_ids'] = limit_ids
     application.bot_data['cooldown'] = cooldown
     application.bot_data['chats'] = chats
 
-    fwd_filter = filters.Regex(rf'^/fwd(?:{re.escape(bot_name)})?(?:\s|$)')
-    about_filter = filters.Regex(rf'^/about(?:{re.escape(bot_name)})?(?:\s|$)')
-
     create_tables_if_missing(chats)
     application.add_handler(
-        MessageHandler(
-            fwd_filter & filters.Chat(chat_id=chats['ascended']),
+        CommandHandler(
+            'fwd',
             meme_forward_ascended,
+            filters=filters.Chat(chat_id=chats['ascended']),
         )
     )
     application.add_handler(
-        MessageHandler(
-            fwd_filter & filters.Chat(chat_id=chats['pinnacle']),
+        CommandHandler(
+            'fwd',
             meme_forward_pinnacle,
+            filters=filters.Chat(chat_id=chats['pinnacle']),
         )
     )
     application.add_handler(
-        MessageHandler(
-            about_filter & filters.Chat(chat_id=chats['ascended']),
+        CommandHandler(
+            'about',
             print_faq_ascended,
+            filters=filters.Chat(chat_id=chats['ascended']),
         )
     )
     application.add_handler(
-        MessageHandler(
-            about_filter & filters.Chat(chat_id=chats['pinnacle']),
+        CommandHandler(
+            'about',
             print_faq_pinnacle,
+            filters=filters.Chat(chat_id=chats['pinnacle']),
         )
     )
+    application.add_handler(MessageHandler(filters.COMMAND, log_command), group=1)
     application.add_error_handler(error_handler)
 
+    logger.info('Starting polling')
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         timeout=30,
