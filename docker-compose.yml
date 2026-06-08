@@ -3,14 +3,41 @@ version: "3.8"
 services:
     forwarder_bot:
         build: .
+        init: true
         environment: 
-          http_proxy: inna_vpnproxy:3128
-          https_proxy: inna_vpnproxy:3128
+          http_proxy: http://inna_vpnproxy:3128
+          https_proxy: http://inna_vpnproxy:3128
         volumes:
           - type: bind
             source: db
             target: /app/db 
-        restart: always
+        restart: unless-stopped
+        stop_grace_period: 30s
+        logging:
+          driver: json-file
+          options:
+            max-size: "10m"
+            max-file: "3"
+        healthcheck:
+          test:
+            - CMD
+            - python
+            - -c
+            - |
+              import httpx, yaml
+              with open('config.yaml', 'r') as f:
+                  token = yaml.safe_load(f)['token']
+              response = httpx.get(
+                  f'https://api.telegram.org/bot{token}/getMe',
+                  timeout=15,
+                  follow_redirects=True,
+                  trust_env=True,
+              )
+              response.raise_for_status()
+          interval: 1m
+          timeout: 20s
+          retries: 3
+          start_period: 30s
         networks:
           - net_vpnproxy
 networks:

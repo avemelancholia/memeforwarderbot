@@ -3,17 +3,19 @@
 import yaml
 import logging
 import sqlite3
-import sys
 import hashlib
+import re
 from sql_queries import get_sql_query
 import pendulum as pdl
 from telegram import Update
+from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     ContextTypes,
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 
 logging.basicConfig(
@@ -25,27 +27,29 @@ logging.getLogger('httpx').setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 # Enable logging
 
+DB_PATH = 'db/meme_forwarder.db'
+DB_TIMEOUT = 10
+
 
 def update_user_table(user_id, chat_type):
     timestamp = pdl.now().int_timestamp
     abuse = 0
     args = {'table': chat_type}
-    con = sqlite3.connect('db/meme_forwarder.db')
-    cur = con.cursor()
-    res = cur.execute(
-        get_sql_query('select_user', args) + f"'{user_id}'"
-    ).fetchone()
+    try:
+        with sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT) as con:
+            cur = con.cursor()
+            res = cur.execute(
+                get_sql_query('select_user', args) + f"'{user_id}'"
+            ).fetchone()
 
-    if res is not None:
-        abuse = res[2] + 1
-        cur.execute(get_sql_query('delete_users', args), (user_id,))
-        con.commit()
-    cur.execute(
-        get_sql_query('insert_user', args), (user_id, timestamp, abuse)
-    )
-    con.commit()
-
-    con.close()
+            if res is not None:
+                abuse = res[2] + 1
+                cur.execute(get_sql_query('delete_users', args), (user_id,))
+            cur.execute(
+                get_sql_query('insert_user', args), (user_id, timestamp, abuse)
+            )
+    except sqlite3.Error:
+        logger.exception('Failed to update user table for %s', chat_type)
 
 
 def get_user_time_diff_abuse(user_id, chat_type, cooldown):
@@ -53,12 +57,15 @@ def get_user_time_diff_abuse(user_id, chat_type, cooldown):
     abuse = 0
     now = pdl.now().int_timestamp
     args = {'table': chat_type}
-    con = sqlite3.connect('db/meme_forwarder.db')
-    cur = con.cursor()
-    res = cur.execute(
-        get_sql_query('select_user', args) + f"'{user_id}'"
-    ).fetchone()
-    con.close()
+    try:
+        with sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT) as con:
+            cur = con.cursor()
+            res = cur.execute(
+                get_sql_query('select_user', args) + f"'{user_id}'"
+            ).fetchone()
+    except sqlite3.Error:
+        logger.exception('Failed to read user table for %s', chat_type)
+        return time_diff, abuse
 
     if res is not None:
         time_diff = now - res[1]
@@ -74,14 +81,21 @@ async def user_can_forward(context, message, chat_type, chats, cooldown):
     if message.reply_to_message is None:
         return can_forward
     reply_user_id = message.reply_to_message.from_user.id
-    chat_member = await context.bot.get_chat_member(chat_id, user_id)
+    try:
+        chat_member = await context.bot.get_chat_member(chat_id, user_id)
+    except (TimedOut, NetworkError, RetryAfter) as exc:
+        logger.warning('Transient Telegram error while checking member: %s', exc)
+        return can_forward
+    except TelegramError:
+        logger.exception('Telegram error while checking member')
+        return can_forward
 
     role_ok = (chat_member.status == 'administrator') or (
         chat_member.status == 'creator'
     )
     member_id_ok = reply_user_id == user_id
     time_diff, abuse = get_user_time_diff_abuse(user_id, chat_type, cooldown)
-    print(time_diff, cooldown + abuse * 10)
+    logger.debug('Forward cooldown: time_diff=%s required=%s', time_diff, cooldown + abuse * 10)
     time_ok = True if (time_diff > cooldown + abuse * 10) else False
 
     if (chat_type == 'ascended') and role_ok and time_ok:
@@ -128,57 +142,58 @@ async def insert_meme_in_db_if_ok(message, chat_type):
         hash_str += reply.text
     if caption_present:
         hash_str += reply.caption
-    print(hash_str)
+    logger.debug('Meme content hash source: %s', hash_str)
 
     hash_str = hash_str.encode('utf8')
     hash_str = hashlib.sha256(hash_str).hexdigest()
     datetime = str(pdl.now().int_timestamp)
     args = {'table': f'{chat_type}'}
 
-    con = sqlite3.connect('db/meme_forwarder.db')
-    cur = con.cursor()
-    res = cur.execute(get_sql_query('select_hashed', args) + f"'{hash_str}'")
-    if res.fetchone() is None:
-        can_forward = True
-    id_to_insert = cur.execute(
-        get_sql_query('get_ids_by_ids', args)
-    ).fetchone()
+    try:
+        with sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT) as con:
+            cur = con.cursor()
+            res = cur.execute(get_sql_query('select_hashed', args) + f"'{hash_str}'")
+            if res.fetchone() is None:
+                can_forward = True
+            id_to_insert = cur.execute(
+                get_sql_query('get_ids_by_ids', args)
+            ).fetchone()
 
-    if id_to_insert is None:
-        id_to_insert = 0
-    else:
-        id_to_insert = id_to_insert[0] + 1
+            if id_to_insert is None:
+                id_to_insert = 0
+            else:
+                id_to_insert = id_to_insert[0] + 1
 
-    cur.execute(
-        get_sql_query('insert_meme', args), (id_to_insert, datetime, hash_str)
-    )
-    con.commit()
-    con.close()
+            cur.execute(
+                get_sql_query('insert_meme', args), (id_to_insert, datetime, hash_str)
+            )
+    except sqlite3.Error:
+        logger.exception('Failed to insert meme for %s', chat_type)
+        return False
 
     return can_forward
 
 
 def create_tables_if_missing(chats):
-    con = sqlite3.connect('db/meme_forwarder.db')
-    cur = con.cursor()
-    for table in chats.keys():
-        args = {'table': table}
-        cur.execute(get_sql_query('create_memes', args))
-        cur.execute(get_sql_query('create_users', args))
-    con.close()
+    with sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT) as con:
+        cur = con.cursor()
+        for table in chats.keys():
+            args = {'table': table}
+            cur.execute(get_sql_query('create_memes', args))
+            cur.execute(get_sql_query('create_users', args))
 
 
 def manage_db_rows(chat_type, limit_ids):
     args = {'table': f'{chat_type}'}
-    con = sqlite3.connect('db/meme_forwarder.db')
-    cur = con.cursor()
-    ids = cur.execute(get_sql_query('get_ids_by_timestamp', args)).fetchall()
+    try:
+        with sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT) as con:
+            cur = con.cursor()
+            ids = cur.execute(get_sql_query('get_ids_by_timestamp', args)).fetchall()
 
-    if len(ids) - 1 > limit_ids:
-        cur.executemany(get_sql_query('delete_ids', args), ids[-limit_ids:])
-
-    con.commit()
-    con.close()
+            if len(ids) - 1 > limit_ids:
+                cur.executemany(get_sql_query('delete_ids', args), ids[-limit_ids:])
+    except sqlite3.Error:
+        logger.exception('Failed to manage DB rows for %s', chat_type)
 
 
 async def meme_forward_ascended(
@@ -202,12 +217,17 @@ async def meme_forward_ascended(
     update_user_table(message.from_user.id, chat_type)
     manage_db_rows(chat_type, limit_ids)
 
-    await context.bot.copy_message(
-        chat_id=chats['pinnacle'],
-        from_chat_id=chats['ascended'],
-        message_id=reply.id,
-        caption='',
-    )
+    try:
+        await context.bot.copy_message(
+            chat_id=chats['pinnacle'],
+            from_chat_id=chats['ascended'],
+            message_id=reply.id,
+            caption='',
+        )
+    except (TimedOut, NetworkError, RetryAfter) as exc:
+        logger.warning('Transient Telegram error while copying ascended meme: %s', exc)
+    except TelegramError:
+        logger.exception('Telegram error while copying ascended meme')
 
 
 async def print_faq_ascended(
@@ -230,7 +250,12 @@ async def print_faq_ascended(
 @сделано меланхолией для чатов FD
 
 """
-    await update.effective_message.reply_text(text)
+    try:
+        await update.effective_message.reply_text(text)
+    except (TimedOut, NetworkError, RetryAfter) as exc:
+        logger.warning('Transient Telegram error while sending ascended FAQ: %s', exc)
+    except TelegramError:
+        logger.exception('Telegram error while sending ascended FAQ')
 
 
 async def print_faq_pinnacle(
@@ -244,12 +269,30 @@ async def print_faq_pinnacle(
 
 @сделано меланхолией для чатов FD
 """
-    await update.effective_message.reply_text(text)
+    try:
+        await update.effective_message.reply_text(text)
+    except (TimedOut, NetworkError, RetryAfter) as exc:
+        logger.warning('Transient Telegram error while sending pinnacle FAQ: %s', exc)
+    except TelegramError:
+        logger.exception('Telegram error while sending pinnacle FAQ')
 
 
 async def error_handler(update, context):
-    print(f"Fatal error: {context.error}", file=sys.stderr)
-    sys.exit(1)
+    exc_info = None
+    if context.error is not None:
+        exc_info = (
+            type(context.error),
+            context.error,
+            context.error.__traceback__,
+        )
+    if isinstance(context.error, RetryAfter):
+        logger.warning('Telegram rate limit, retry after %s seconds', context.error.retry_after)
+    elif isinstance(context.error, (TimedOut, NetworkError)):
+        logger.warning('Transient Telegram network error: %s', context.error)
+    elif isinstance(context.error, TelegramError):
+        logger.error('Telegram error while handling update', exc_info=exc_info)
+    else:
+        logger.error('Unexpected error while handling update', exc_info=exc_info)
 
 
 async def meme_forward_pinnacle(
@@ -258,7 +301,7 @@ async def meme_forward_pinnacle(
 
     chat_type = 'pinnacle'
     message = update.message
-    print(context.bot_data)
+    logger.debug('Bot data: %s', context.bot_data)
     limit_ids = context.bot_data['limit_ids']
     cooldown = context.bot_data['cooldown']
     chats = context.bot_data['chats']
@@ -274,12 +317,17 @@ async def meme_forward_pinnacle(
     update_user_table(message.from_user.id, chat_type)
     manage_db_rows(chat_type, limit_ids)
 
-    await context.bot.copy_message(
-        chat_id=chats['channel'],
-        from_chat_id=chats['pinnacle'],
-        message_id=reply.id,
-        caption='',
-    )
+    try:
+        await context.bot.copy_message(
+            chat_id=chats['channel'],
+            from_chat_id=chats['pinnacle'],
+            message_id=reply.id,
+            caption='',
+        )
+    except (TimedOut, NetworkError, RetryAfter) as exc:
+        logger.warning('Transient Telegram error while copying pinnacle meme: %s', exc)
+    except TelegramError:
+        logger.exception('Telegram error while copying pinnacle meme')
 
 
 def main() -> None:
@@ -297,43 +345,53 @@ def main() -> None:
         'channel': data['channel'],
     }
 
-    application = Application.builder().token(token).build()
+    request = HTTPXRequest(
+        connect_timeout=15,
+        read_timeout=30,
+        write_timeout=30,
+        pool_timeout=15,
+    )
+    application = Application.builder().token(token).request(request).build()
     application.bot_data['limit_ids'] = limit_ids
     application.bot_data['cooldown'] = cooldown
     application.bot_data['chats'] = chats
 
+    fwd_filter = filters.Regex(rf'^/fwd(?:{re.escape(bot_name)})?(?:\s|$)')
+    about_filter = filters.Regex(rf'^/about(?:{re.escape(bot_name)})?(?:\s|$)')
+
     create_tables_if_missing(chats)
     application.add_handler(
         MessageHandler(
-            (filters.Regex('/fwd') or filters.Regex('/fwd{bot_name}'))
-            & filters.Chat(chat_id=chats['ascended']),
+            fwd_filter & filters.Chat(chat_id=chats['ascended']),
             meme_forward_ascended,
         )
     )
     application.add_handler(
         MessageHandler(
-            (filters.Regex('/fwd') or filters.Regex('/fwd{bot_name}'))
-            & filters.Chat(chat_id=chats['pinnacle']),
+            fwd_filter & filters.Chat(chat_id=chats['pinnacle']),
             meme_forward_pinnacle,
         )
     )
     application.add_handler(
         MessageHandler(
-            filters.Regex(f'/about{bot_name}')
-            & filters.Chat(chat_id=chats['ascended']),
+            about_filter & filters.Chat(chat_id=chats['ascended']),
             print_faq_ascended,
         )
     )
     application.add_handler(
         MessageHandler(
-            filters.Regex(f'/about{bot_name}')
-            & filters.Chat(chat_id=chats['pinnacle']),
+            about_filter & filters.Chat(chat_id=chats['pinnacle']),
             print_faq_pinnacle,
         )
     )
     application.add_error_handler(error_handler)
 
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        timeout=30,
+        bootstrap_retries=-1,
+        drop_pending_updates=False,
+    )
 
 
 if __name__ == '__main__':
