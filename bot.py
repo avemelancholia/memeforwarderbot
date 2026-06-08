@@ -3,6 +3,7 @@
 import yaml
 import logging
 import sqlite3
+import sys
 import hashlib
 from sql_queries import get_sql_query
 import pendulum as pdl
@@ -246,6 +247,11 @@ async def print_faq_pinnacle(
     await update.effective_message.reply_text(text)
 
 
+async def error_handler(update, context):
+    print(f"Fatal error: {context.error}", file=sys.stderr)
+    sys.exit(1)
+
+
 async def meme_forward_pinnacle(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -325,6 +331,7 @@ def main() -> None:
             print_faq_pinnacle,
         )
     )
+    application.add_error_handler(error_handler)
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 

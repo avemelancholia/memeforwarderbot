@@ -3,7 +3,17 @@ version: "3.8"
 services:
     forwarder_bot:
         build: .
+        environment: 
+          http_proxy: inna_vpnproxy:3128
+          https_proxy: inna_vpnproxy:3128
         volumes:
           - type: bind
             source: db
             target: /app/db 
+        restart: always
+        networks:
+          - net_vpnproxy
+networks:
+  net_vpnproxy:
+    name: inna_net_vpnproxy
+    external: true
