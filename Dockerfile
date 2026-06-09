@@ -1,7 +1,8 @@
 FROM anaconda/miniconda
 
-COPY sql_queries.py requirements.txt bot.py config.yaml config.yaml /app/
-RUN pip install -r /app/requirements.txt
 WORKDIR /app
+COPY requirements.txt /app/
+RUN pip install -r /app/requirements.txt
+COPY sql_queries.py bot.py config.yaml /app/
 
 CMD ["python", "bot.py"]

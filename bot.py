@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 # This program is dedicated to the public domain under the CC0 license.
 import yaml
+import asyncio
 import logging
+import os
 import sqlite3
 import hashlib
 from sql_queries import get_sql_query
@@ -29,6 +31,9 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = 'db/meme_forwarder.db'
 DB_TIMEOUT = 10
+WATCHDOG_INTERVAL = 60
+WATCHDOG_TIMEOUT = 20
+WATCHDOG_MAX_FAILURES = 3
 
 
 def update_user_table(user_id, chat_type):
@@ -353,6 +358,36 @@ async def post_init(application: Application) -> None:
         logger.exception('Telegram error while reading bot info')
 
     logger.info('Configured chats: %s', application.bot_data['chats'])
+    application.create_task(telegram_watchdog(application))
+
+
+async def telegram_watchdog(application: Application) -> None:
+    failures = 0
+
+    while True:
+        await asyncio.sleep(WATCHDOG_INTERVAL)
+        try:
+            await asyncio.wait_for(
+                application.bot.get_me(),
+                timeout=WATCHDOG_TIMEOUT,
+            )
+            if failures:
+                logger.info('Telegram watchdog recovered after %s failures', failures)
+            failures = 0
+            logger.debug('Telegram watchdog ping ok')
+        except Exception:
+            failures += 1
+            logger.exception(
+                'Telegram watchdog ping failed %s/%s',
+                failures,
+                WATCHDOG_MAX_FAILURES,
+            )
+
+            if failures >= WATCHDOG_MAX_FAILURES:
+                logger.critical(
+                    'Telegram watchdog failed repeatedly, exiting for Docker restart'
+                )
+                os._exit(1)
 
 
 def main() -> None:
