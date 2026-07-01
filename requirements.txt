@@ -1,3 +1,4 @@
 pendulum
+Pillow
 python-telegram-bot
 pyyaml
