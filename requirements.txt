@@ -1,4 +1,4 @@
 pendulum
 Pillow
-python-telegram-bot
+python-telegram-bot==22.8
 pyyaml

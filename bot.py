@@ -3,11 +3,15 @@
 import yaml
 import asyncio
 import html
+import json
 import logging
 import os
+import signal
+import time
 import sqlite3
 import hashlib
 from io import BytesIO
+from pathlib import Path
 from sql_queries import get_sql_query
 import pendulum as pdl
 from PIL import Image, ImageDraw, ImageFont
@@ -37,8 +41,20 @@ DB_PATH = 'db/meme_forwarder.db'
 DB_TIMEOUT = 10
 WATCHDOG_INTERVAL = 60
 WATCHDOG_TIMEOUT = 20
+POLLING_TIMEOUT = 20
+POLLING_READ_TIMEOUT = 5
 REACTION_FLUSH_INTERVAL = 60
 SUBSCRIBER_CHECK_INTERVAL = 60
+HEARTBEAT_INTERVAL = 5
+HEARTBEAT_PATH = Path(
+    os.environ.get('BOT_HEARTBEAT_PATH', '/tmp/meme-forwarder-heartbeat.json')
+)
+BOOT_ID = os.environ.get('BOT_BOOT_ID', f'standalone-{os.getpid()}')
+SHUTDOWN_TIMEOUT = 20
+
+
+class RestartRequired(RuntimeError):
+    """Signal that the process must exit so Docker can restart the container."""
 
 
 def update_user_table(user_id, chat_type):
@@ -1277,13 +1293,7 @@ async def error_handler(update, context):
             context.error,
             context.error.__traceback__,
         )
-    if update is None and isinstance(context.error, (TimedOut, NetworkError)):
-        logger.critical(
-            'Telegram polling network error, exiting for Docker restart',
-            exc_info=exc_info,
-        )
-        os._exit(1)
-    elif isinstance(context.error, RetryAfter):
+    if isinstance(context.error, RetryAfter):
         logger.warning('Telegram rate limit, retry after %s seconds', context.error.retry_after)
     elif isinstance(context.error, (TimedOut, NetworkError)):
         logger.warning('Transient Telegram network error: %s', context.error)
@@ -1435,6 +1445,7 @@ async def check_channel_subscribers(application: Application) -> None:
 
 
 async def subscriber_monitor_loop(application: Application) -> None:
+    await initialize_subscriber_baseline(application)
     while True:
         await asyncio.sleep(SUBSCRIBER_CHECK_INTERVAL)
         await check_channel_subscribers(application)
@@ -1504,22 +1515,6 @@ async def meme_forward_pinnacle(
             )
 
 
-async def post_init(application: Application) -> None:
-    try:
-        me = await application.bot.get_me()
-        logger.info('Bot started as @%s', me.username)
-    except (TimedOut, NetworkError, RetryAfter) as exc:
-        logger.warning('Transient Telegram error while reading bot info: %s', exc)
-    except TelegramError:
-        logger.exception('Telegram error while reading bot info')
-
-    logger.info('Configured chats: %s', application.bot_data['chats'])
-    await initialize_subscriber_baseline(application)
-    application.create_task(telegram_watchdog(application))
-    application.create_task(reaction_flush_loop(application))
-    application.create_task(subscriber_monitor_loop(application))
-
-
 async def telegram_watchdog(application: Application) -> None:
     while True:
         await asyncio.sleep(WATCHDOG_INTERVAL)
@@ -1536,18 +1531,217 @@ async def telegram_watchdog(application: Application) -> None:
             )
         except asyncio.CancelledError:
             raise
-        except (TimedOut, NetworkError, TimeoutError):
+        except (TimedOut, NetworkError, TimeoutError) as exc:
             logger.critical(
-                'Telegram watchdog network check failed, exiting for Docker restart',
+                'Telegram watchdog network check failed; requesting restart',
                 exc_info=True,
             )
-            os._exit(1)
-        except Exception:
+            raise RestartRequired('Telegram watchdog network failure') from exc
+        except Exception as exc:
             logger.critical(
-                'Unexpected Telegram watchdog failure, exiting for Docker restart',
+                'Unexpected Telegram watchdog failure; requesting restart',
                 exc_info=True,
             )
-            os._exit(1)
+            raise RestartRequired('Unexpected Telegram watchdog failure') from exc
+
+
+def write_heartbeat(phase: str, path: Path = HEARTBEAT_PATH) -> None:
+    payload = {
+        'boot_id': BOOT_ID,
+        'pid': os.getpid(),
+        'phase': phase,
+        'timestamp': time.time(),
+    }
+    temporary_path = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path.write_text(json.dumps(payload), encoding='utf-8')
+    os.replace(temporary_path, path)
+
+
+async def heartbeat_loop(state: dict, path: Path = HEARTBEAT_PATH) -> None:
+    while True:
+        write_heartbeat(state['phase'], path)
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+
+def build_polling_error_callback(polling_errors: asyncio.Queue):
+    def polling_error_callback(error: TelegramError) -> None:
+        if isinstance(error, RetryAfter):
+            logger.warning(
+                'Telegram polling rate limited, retry after %s seconds',
+                error.retry_after,
+            )
+            return
+
+        if polling_errors.empty():
+            polling_errors.put_nowait(error)
+
+    return polling_error_callback
+
+
+async def wait_for_runtime_failure(
+    tasks: list[asyncio.Task],
+    polling_errors: asyncio.Queue,
+    stop_event: asyncio.Event,
+) -> None:
+    polling_error_task = asyncio.create_task(
+        polling_errors.get(),
+        name='polling-error-waiter',
+    )
+    stop_task = asyncio.create_task(stop_event.wait(), name='stop-signal-waiter')
+    waiters = {polling_error_task, stop_task}
+
+    try:
+        done, _ = await asyncio.wait(
+            {*tasks, *waiters},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if stop_task in done:
+            return
+
+        if polling_error_task in done:
+            error = polling_error_task.result()
+            raise RestartRequired(
+                f'Telegram polling failed: {type(error).__name__}: {error}'
+            ) from error
+
+        for task in tasks:
+            if task not in done:
+                continue
+            try:
+                task.result()
+            except asyncio.CancelledError as exc:
+                raise RestartRequired(
+                    f'Background task {task.get_name()} was cancelled unexpectedly'
+                ) from exc
+            except RestartRequired:
+                raise
+            except Exception as exc:
+                raise RestartRequired(
+                    f'Background task {task.get_name()} failed'
+                ) from exc
+            raise RestartRequired(
+                f'Background task {task.get_name()} stopped unexpectedly'
+            )
+    finally:
+        for waiter in waiters:
+            waiter.cancel()
+        await asyncio.gather(*waiters, return_exceptions=True)
+
+
+async def stop_application(
+    application: Application,
+    background_tasks: list[asyncio.Task],
+) -> None:
+    for task in background_tasks:
+        task.cancel()
+    await asyncio.gather(*background_tasks, return_exceptions=True)
+
+    if application.updater is not None and application.updater.running:
+        await asyncio.wait_for(
+            application.updater.stop(),
+            timeout=SHUTDOWN_TIMEOUT,
+        )
+    if application.running:
+        await asyncio.wait_for(
+            application.stop(),
+            timeout=SHUTDOWN_TIMEOUT,
+        )
+
+
+def install_signal_handlers(stop_event: asyncio.Event) -> list[signal.Signals]:
+    loop = asyncio.get_running_loop()
+    registered = []
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except (NotImplementedError, RuntimeError):
+            logger.warning('Could not register signal handler for %s', sig.name)
+        else:
+            registered.append(sig)
+    return registered
+
+
+async def run_application(
+    application: Application,
+    *,
+    stop_event: asyncio.Event | None = None,
+    heartbeat_path: Path = HEARTBEAT_PATH,
+) -> None:
+    owns_stop_event = stop_event is None
+    stop_event = stop_event or asyncio.Event()
+    registered_signals = (
+        install_signal_handlers(stop_event) if owns_stop_event else []
+    )
+    heartbeat_state = {'phase': 'starting'}
+    heartbeat_task = asyncio.create_task(
+        heartbeat_loop(heartbeat_state, heartbeat_path),
+        name='event-loop-heartbeat',
+    )
+    background_tasks = []
+    polling_errors = asyncio.Queue(maxsize=1)
+
+    try:
+        async with application:
+            try:
+                if application.updater is None:
+                    raise RuntimeError('Application has no polling updater')
+
+                logger.info('Starting polling boot_id=%s', BOOT_ID)
+                await application.updater.start_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    timeout=POLLING_TIMEOUT,
+                    bootstrap_retries=0,
+                    drop_pending_updates=False,
+                    error_callback=build_polling_error_callback(polling_errors),
+                )
+                await application.start()
+
+                heartbeat_state['phase'] = 'running'
+                write_heartbeat('running', heartbeat_path)
+                logger.info(
+                    'Bot started as @%s boot_id=%s',
+                    getattr(application.bot, 'username', None),
+                    BOOT_ID,
+                )
+                logger.info(
+                    'Configured chats: %s',
+                    application.bot_data['chats'],
+                )
+
+                background_tasks = [
+                    asyncio.create_task(
+                        telegram_watchdog(application),
+                        name='telegram-watchdog',
+                    ),
+                    asyncio.create_task(
+                        reaction_flush_loop(application),
+                        name='reaction-flush',
+                    ),
+                    asyncio.create_task(
+                        subscriber_monitor_loop(application),
+                        name='subscriber-monitor',
+                    ),
+                ]
+                await wait_for_runtime_failure(
+                    [heartbeat_task, *background_tasks],
+                    polling_errors,
+                    stop_event,
+                )
+            finally:
+                heartbeat_state['phase'] = 'stopping'
+                try:
+                    write_heartbeat('stopping', heartbeat_path)
+                except OSError:
+                    logger.exception('Failed to write stopping heartbeat')
+                await stop_application(application, background_tasks)
+    finally:
+        heartbeat_task.cancel()
+        await asyncio.gather(heartbeat_task, return_exceptions=True)
+        loop = asyncio.get_running_loop()
+        for sig in registered_signals:
+            loop.remove_signal_handler(sig)
 
 
 def main() -> None:
@@ -1568,11 +1762,17 @@ def main() -> None:
         write_timeout=30,
         pool_timeout=15,
     )
+    polling_request = HTTPXRequest(
+        connect_timeout=15,
+        read_timeout=POLLING_READ_TIMEOUT,
+        write_timeout=30,
+        pool_timeout=15,
+    )
     application = (
         Application.builder()
         .token(token)
         .request(request)
-        .post_init(post_init)
+        .get_updates_request(polling_request)
         .build()
     )
     application.bot_data['cooldown'] = cooldown
@@ -1618,13 +1818,16 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.COMMAND, log_command), group=1)
     application.add_error_handler(error_handler)
 
-    logger.info('Starting polling')
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        timeout=30,
-        bootstrap_retries=0,
-        drop_pending_updates=False,
-    )
+    try:
+        asyncio.run(run_application(application))
+    except KeyboardInterrupt:
+        logger.info('Bot stopped by keyboard interrupt')
+    except Exception:
+        logger.critical(
+            'Bot runtime failed; exiting for container restart',
+            exc_info=True,
+        )
+        raise SystemExit(1)
 
 
 if __name__ == '__main__':
